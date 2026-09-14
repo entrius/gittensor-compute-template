@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dev deps
+        run: pip install jsonschema==4.25.1 pyyaml==6.0.3 ruff==0.15.12
+      - name: Lint
+        run: ruff check . && ruff format --check .
+      - name: Validate every manifest
+        run: python3 scripts/validate manifest.yaml manifests/*.yaml
+      - name: Build the image
+        run: docker build -t gt-template:ci .
+      - name: Smoke the image (no GPU)
+        run: python3 scripts/validate --build manifest.yaml

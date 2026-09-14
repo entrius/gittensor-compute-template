@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# The MIT License (MIT)
+# Copyright © 2025 Entrius
+
+"""scripts/validate: is this manifest in spec? No GPU needed.
+
+    scripts/validate                       # ./manifest.yaml against manifest.schema.json + consistency checks
+    scripts/validate manifests/vllm.yaml   # any manifest file(s)
+    scripts/validate --build               # also: docker build ., start the image, wait for the health path
+    scripts/validate --strict              # a placeholder (all-zeros) image digest is an error
+
+Exit 0 when every manifest passes, 1 with the problems listed otherwise. `--build` runs the image with
+SKIP_ARTIFACT_CHECK=1 and no GPU: it proves the image builds and its server answers the manifest's health path,
+not that the workload works (that is `scripts/qualify`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _manifest import REPO, check  # noqa: E402
+
+SMOKE_NAME = 'gt-template-smoke'
+SMOKE_TAG = 'gt-template-smoke:local'
+
+
+def smoke_build(manifest: dict, timeout_s: float) -> list[str]:
+    """docker build, run without GPU, probe health.http within timeout_s. Returns problems."""
+    health = manifest.get('health', {})
+    if 'http' not in health:
+        return ['--build: only manifests with an http health probe can be smoked without a GPU']
+    port = health['http']['port']
+    path = health['http']['path']
+    expect = health['http'].get('expect_status', 200)
+
+    build = subprocess.run(['docker', 'build', '-t', SMOKE_TAG, str(REPO)], capture_output=True, text=True)
+    if build.returncode != 0:
+        return ['docker build failed:\n' + (build.stderr or build.stdout)[-2000:]]
+
+    subprocess.run(['docker', 'rm', '-f', SMOKE_NAME], capture_output=True)
+    run = subprocess.run(
+        [
+            'docker', 'run', '-d', '--name', SMOKE_NAME, '-e', 'SKIP_ARTIFACT_CHECK=1',
+            '-p', f'127.0.0.1::{port}', SMOKE_TAG,
+        ],
+        capture_output=True,
+        text=True,
+    )  # fmt: skip
+    if run.returncode != 0:
+        return ['docker run failed: ' + (run.stderr or run.stdout).strip()[-500:]]
+    try:
+        host_port = (
+            subprocess.run(['docker', 'port', SMOKE_NAME, str(port)], capture_output=True, text=True)
+            .stdout.strip()
+            .rsplit(':', 1)[-1]
+        )
+        url = f'http://127.0.0.1:{host_port}{path}'
+        deadline = time.monotonic() + timeout_s
+        last = 'no response yet'
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    if resp.status == expect:
+                        return []
+                    last = f'HTTP {resp.status}'
+            except urllib.error.HTTPError as e:
+                if e.code == expect:
+                    return []
+                last = f'HTTP {e.code}'
+            except (urllib.error.URLError, OSError) as e:
+                last = str(e.reason if hasattr(e, 'reason') else e)
+            state = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', SMOKE_NAME], capture_output=True, text=True
+            ).stdout.strip()
+            if state != 'true':
+                logs = subprocess.run(['docker', 'logs', SMOKE_NAME], capture_output=True, text=True)
+                return ['container exited before the health path answered:\n' + (logs.stderr + logs.stdout)[-2000:]]
+            time.sleep(1)
+        return [f'health {path} on port {port} did not answer {expect} within {timeout_s:.0f}s (last: {last})']
+    finally:
+        subprocess.run(['docker', 'rm', '-f', SMOKE_NAME], capture_output=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description='Validate a compute-pool image manifest against the spec.')
+    p.add_argument('manifests', nargs='*', default=['manifest.yaml'], help='manifest file(s); default ./manifest.yaml')
+    p.add_argument('--build', action='store_true', help='also docker build + start + probe the health path (no GPU)')
+    p.add_argument('--strict', action='store_true', help='treat a placeholder (all-zeros) image digest as an error')
+    p.add_argument('--timeout', type=float, default=60.0, help='seconds to wait for the health path under --build')
+    a = p.parse_args(argv)
+
+    failed = 0
+    for name in a.manifests:
+        path = Path(name)
+        manifest, problems = check(path, allow_placeholder_digest=not a.strict)
+        if not problems and a.build and manifest is not None:
+            if path.resolve() != (REPO / 'manifest.yaml').resolve():
+                problems.append('--build builds this repo, which copies ./manifest.yaml; run it on that file')
+            else:
+                problems = smoke_build(manifest, a.timeout)
+        if problems:
+            failed += 1
+            print(f'FAIL {path}')
+            for line in problems:
+                print(f'  - {line}')
+        else:
+            extra = ' (built and health path answered)' if a.build else ''
+            print(f'ok   {path}{extra}')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    os.chdir(REPO) if not Path('manifest.yaml').exists() and (REPO / 'manifest.yaml').exists() else None
+    sys.exit(main())

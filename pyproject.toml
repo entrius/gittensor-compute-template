@@ -1,0 +1,28 @@
+[project]
+name = "gittensor-compute-template"
+version = "0.1.0"
+description = "Fork-to-build base for a blessed workload image on the Gittensor compute pool (Bittensor SN74)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+# No package: this repo is a Dockerfile, a manifest and two scripts. The runtime deps below are for the scripts only.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "jsonschema==4.25.1",
+    "pyyaml==6.0.3",
+    "ruff==0.15.12",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+include = ["scripts/validate", "scripts/qualify", "*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "single"

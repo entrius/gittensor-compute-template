@@ -1,0 +1,54 @@
+# Ready manifest for a vLLM image (OpenAI-compatible server on its conventional port 8000). Copy over
+# ./manifest.yaml, then fill every TODO. Tool parsing is the runtime's job: start vLLM with the tool-call parser
+# flags for your model (`--enable-auto-tool-choice --tool-call-parser ...`) so the canary below can pass.
+name: my-model-vllm
+version: 1
+description: TODO one line, what model and what shape
+runtime: vllm
+image: entrius/my-model-vllm@sha256:0000000000000000000000000000000000000000000000000000000000000000  # TODO
+placement:
+  gpu_types: {include: [RTX5090]}
+  cards_per_instance: 1
+  min_vram_gb: 30            # TODO weights + KV headroom
+  max_load_s: 600            # TODO measured cold load
+run:
+  env:
+    VLLM_NO_USAGE_STATS: '1' # no phone-home; egress is closed anyway
+  volumes: [{name: models, mount: /models, read_only: true}]
+network:
+  egress: []
+artifacts:
+  - path: /models/TODO-model-dir
+    source: hf://TODO-org/TODO-repo
+    revision: TODO-commit-sha
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+health:
+  http: {path: /v1/models, port: 8000, expect_status: 200}
+  interval_s: 60
+  failure_threshold: 3
+entry_canary:
+  - type: http
+    http: {method: POST, path: /v1/chat/completions, port: 8000}
+    body:
+      messages: [{role: user, content: "What is 17 × 23? Use the multiply tool."}]
+      max_tokens: 64
+      tools:
+        - type: function
+          function:
+            name: multiply
+            parameters: {type: object, properties: {a: {type: number}, b: {type: number}}, required: [a, b]}
+    pass: {status: 200, regex: 'multiply[\s\S]*17[\s\S]*23'}
+profile:
+  decode_tps_single: 0       # TODO from qualify
+  decode_tps_aggregate: 0    # TODO from qualify
+  vram_gb: 0                 # TODO from qualify
+front_door:
+  type: gateway-openai
+  port: 8000
+  concurrency: 4             # TODO measured at agent-sized prompts
+  routes:
+    - {path: /v1/chat/completions, method: POST, stream: true}
+    - {path: /v1/models, method: GET}
+drain:
+  type: requests
+  max_s: 60

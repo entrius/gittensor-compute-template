@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+# The MIT License (MIT)
+# Copyright © 2025 Entrius
+
+"""scripts/qualify: does this image do what its manifest claims, on a real card? Needs an RTX 5090, the NVIDIA
+driver, Docker and the NVIDIA container toolkit. Installs nothing on the host; everything runs in the container.
+
+    scripts/qualify --models-dir /path/to/weights            # build ., run it on GPU 0, measure
+    scripts/qualify --image entrius/my-image@sha256:...      # a pushed image instead of a local build
+    scripts/qualify --gpu GPU-<uuid> --models-dir ...        # pin a card by UUID
+
+What it measures, against manifest.yaml:
+  load time      container start -> first passing health probe, must be <= placement.max_load_s
+  artifacts      the entrypoint's sha256 check passes (the container stays up)
+  canaries       every entry_canary, sent at front_door.concurrency in parallel (each must pass every time)
+  vram           nvidia-smi memory.used on the card after the canaries, reported against placement.min_vram_gb
+                 and profile.vram_gb if present
+  drain          SIGTERM -> the container exits within drain.max_s
+
+Prints a pass/fail table and writes qualify-report.json. Exit 0 only if every row passes. Blessing still means
+we re-qualify on our own card; this is so you know before you submit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _manifest import REPO, check  # noqa: E402
+
+NAME = 'gt-qualify'
+LOCAL_TAG = 'gt-qualify:local'
+
+
+class Row:
+    def __init__(self, name: str, ok: bool | None, detail: str):
+        self.name, self.ok, self.detail = name, ok, detail
+
+    @property
+    def status(self) -> str:
+        return 'skip' if self.ok is None else ('pass' if self.ok else 'FAIL')
+
+    def as_dict(self) -> dict:
+        return {'name': self.name, 'status': self.status, 'detail': self.detail}
+
+
+def sh(cmd: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def nvidia_smi(gpu: str, field: str) -> str:
+    out = sh(['nvidia-smi', f'--id={gpu}', f'--query-gpu={field}', '--format=csv,noheader,nounits'])
+    return out.stdout.strip() if out.returncode == 0 else ''
+
+
+def http(method: str, url: str, body: Any = None, timeout: float = 600.0) -> tuple[int, str]:
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode(errors='replace')
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors='replace')
+
+
+def get_path(obj: Any, dotted: str) -> Any:
+    for part in dotted.split('.'):
+        if isinstance(obj, list) and part.isdigit():
+            obj = obj[int(part)]
+        elif isinstance(obj, dict):
+            obj = obj.get(part)
+        else:
+            return None
+    return obj
+
+
+def judge_http(rule: dict, status: int, text: str) -> tuple[bool, str]:
+    if status != rule['status']:
+        return False, f'status {status} != {rule["status"]}: {text[:200]!r}'
+    if 'contains' in rule and rule['contains'] not in text:
+        return False, f'{rule["contains"]!r} not in body: {text[:200]!r}'
+    if 'regex' in rule and not re.search(rule['regex'], text):
+        return False, f'regex {rule["regex"]!r} did not match: {text[:200]!r}'
+    if 'json_field' in rule:
+        try:
+            got = get_path(json.loads(text), rule['json_field'])
+        except ValueError:
+            return False, 'body is not JSON'
+        if got != rule['equals']:
+            return False, f'{rule["json_field"]} = {got!r} != {rule["equals"]!r}'
+    return True, f'status {status}, {len(text)} bytes'
+
+
+def run_canary(canary: dict, base_url: str, container: str) -> tuple[bool, str]:
+    kind = canary['type']
+    rule = canary.get('pass', {})
+    if kind == 'http':
+        h = canary['http']
+        status, text = http(h['method'], f'{base_url}{h["path"]}', canary.get('body'))
+        return judge_http(rule, status, text)
+    if kind == 'command':
+        proc = sh(['docker', 'exec', container, *canary['command']], timeout=600)
+        out = proc.stdout + proc.stderr
+        if proc.returncode != rule.get('exit_code', 0):
+            return False, f'exit {proc.returncode} != {rule.get("exit_code", 0)}: {out[:200]!r}'
+        if 'contains' in rule and rule['contains'] not in out:
+            return False, f'{rule["contains"]!r} not in output'
+        if 'regex' in rule and not re.search(rule['regex'], out):
+            return False, f'regex {rule["regex"]!r} did not match'
+        return True, f'exit {proc.returncode}'
+    return None, 'fixture canaries are not implemented in qualify yet'  # type: ignore[return-value]
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description='Qualify a compute-pool image on your own 5090.')
+    p.add_argument('--manifest', default=str(REPO / 'manifest.yaml'))
+    p.add_argument('--image', default=None, help='a pushed image ref; default: docker build this repo')
+    p.add_argument('--models-dir', required=True, help='host directory with the pre-staged artifacts')
+    p.add_argument('--gpu', default='0', help='nvidia-smi id or GPU-<uuid> to run on (default 0)')
+    p.add_argument('--report', default='qualify-report.json')
+    a = p.parse_args(argv)
+
+    manifest, problems = check(Path(a.manifest))
+    if problems or manifest is None:
+        print('manifest does not validate; run scripts/validate first:')
+        for line in problems:
+            print(f'  - {line}')
+        return 1
+
+    rows: list[Row] = []
+    report: dict[str, Any] = {'manifest': a.manifest, 'gpu': a.gpu, 'started_at': time.time()}
+    placement, health, fd, drain = manifest['placement'], manifest['health'], manifest['front_door'], manifest['drain']
+    port = fd.get('port') or health.get('http', {}).get('port')
+    if 'http' not in health or port is None:
+        print('qualify handles http health probes only for now')
+        return 1
+
+    image = a.image
+    if image is None:
+        build = sh(['docker', 'build', '-t', LOCAL_TAG, str(REPO)])
+        if build.returncode != 0:
+            print('docker build failed:\n' + (build.stderr or build.stdout)[-2000:])
+            return 1
+        image = LOCAL_TAG
+    report['image'] = image
+
+    mounts = [v['mount'] for v in manifest.get('run', {}).get('volumes') or []] or ['/models']
+    env_flags: list[str] = []
+    for k, v in (manifest.get('run', {}).get('env') or {}).items():
+        env_flags += ['-e', f'{k}={v}']
+    sh(['docker', 'rm', '-f', NAME])
+    gpus = f'"device={a.gpu}"' if a.gpu.startswith('GPU-') else f'device={a.gpu}'
+    cmd = ['docker', 'run', '-d', '--name', NAME, '--gpus', gpus, '-p', f'127.0.0.1::{port}', *env_flags]
+    for mnt in mounts:
+        cmd += ['-v', f'{Path(a.models_dir).resolve()}:{mnt}:ro']
+    cmd.append(image)
+    t0 = time.monotonic()
+    run = sh(cmd)
+    if run.returncode != 0:
+        print('docker run failed: ' + (run.stderr or run.stdout).strip()[-500:])
+        return 1
+
+    try:
+        host_port = sh(['docker', 'port', NAME, str(port)]).stdout.strip().rsplit(':', 1)[-1]
+        base = f'http://127.0.0.1:{host_port}'
+        hp = health['http']
+        expect = hp.get('expect_status', 200)
+        load_s = None
+        deadline = t0 + placement['max_load_s']
+        while time.monotonic() < deadline:
+            state = sh(['docker', 'inspect', '--format', '{{.State.Running}}', NAME]).stdout.strip()
+            if state != 'true':
+                logs = sh(['docker', 'logs', NAME])
+                rows.append(Row('artifacts + start', False, 'container exited: ' + (logs.stderr + logs.stdout)[-300:]))
+                break
+            try:
+                status, _ = http('GET', f'{base}{hp["path"]}', timeout=5)
+                if status == expect:
+                    load_s = time.monotonic() - t0
+                    break
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(2)
+        if load_s is None:
+            if not rows:
+                rows.append(Row('load time', False, f'health not passing within max_load_s={placement["max_load_s"]}'))
+        else:
+            rows.append(Row('artifacts + start', True, 'container up, artifact check passed'))
+            rows.append(
+                Row(
+                    'load time',
+                    load_s <= placement['max_load_s'],
+                    f'{load_s:.0f}s (max_load_s {placement["max_load_s"]})',
+                )
+            )
+            report['load_s'] = round(load_s, 1)
+
+            canaries = manifest.get('entry_canary') or []
+            conc = fd.get('concurrency', 1)
+            for i, canary in enumerate(canaries):
+                t1 = time.monotonic()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
+                    results = list(ex.map(lambda _: run_canary(canary, base, NAME), range(conc)))
+                elapsed = time.monotonic() - t1
+                if any(ok is None for ok, _ in results):
+                    rows.append(Row(f'canary[{i}] {canary["type"]}', None, results[0][1]))
+                    continue
+                bad = [d for ok, d in results if not ok]
+                rows.append(
+                    Row(
+                        f'canary[{i}] {canary["type"]} x{conc}',
+                        not bad,
+                        f'{conc - len(bad)}/{conc} passed in {elapsed:.1f}s'
+                        + (f'; first failure: {bad[0]}' if bad else ''),
+                    )
+                )
+            if not canaries:
+                rows.append(Row('canaries', None, 'none declared; the health probe alone carries the start'))
+
+            used_mib = nvidia_smi(a.gpu, 'memory.used')
+            if used_mib.isdigit():
+                used_gb = int(used_mib) / 1024
+                report['vram_used_gb'] = round(used_gb, 1)
+                rows.append(
+                    Row(
+                        'vram',
+                        used_gb <= placement['min_vram_gb'],
+                        f'{used_gb:.1f} GB used on the card (min_vram_gb {placement["min_vram_gb"]}'
+                        + (
+                            f', profile.vram_gb {manifest["profile"]["vram_gb"]}'
+                            if 'vram_gb' in manifest.get('profile', {})
+                            else ''
+                        )
+                        + ')',
+                    )
+                )
+            else:
+                rows.append(Row('vram', None, 'nvidia-smi unavailable on the host'))
+            report['gpu_name'] = nvidia_smi(a.gpu, 'name')
+
+            # Drain: SIGTERM, then the container must be gone within drain.max_s (kill = no grace, skip).
+            if drain['type'] == 'kill':
+                rows.append(Row('drain', None, 'drain.type kill: no grace window to measure'))
+            else:
+                t2 = time.monotonic()
+                sh(['docker', 'kill', '--signal', 'SIGTERM', NAME])
+                gone = False
+                while time.monotonic() - t2 < drain['max_s'] + 5:
+                    if sh(['docker', 'inspect', '--format', '{{.State.Running}}', NAME]).stdout.strip() != 'true':
+                        gone = True
+                        break
+                    time.sleep(1)
+                drained = time.monotonic() - t2
+                rows.append(
+                    Row(
+                        'drain',
+                        gone and drained <= drain['max_s'],
+                        f'exited in {drained:.0f}s (drain.max_s {drain["max_s"]})',
+                    )
+                )
+                report['drain_s'] = round(drained, 1)
+    finally:
+        sh(['docker', 'rm', '-f', NAME])
+
+    width = max(len(r.name) for r in rows) + 2
+    print(f'\nqualify — {manifest["name"]} v{manifest["version"]} on {report.get("gpu_name") or a.gpu}\n')
+    for r in rows:
+        print(f'  {r.name.ljust(width)} {r.status:5} {r.detail}')
+    ok = all(r.ok is not False for r in rows)
+    report['rows'] = [r.as_dict() for r in rows]
+    report['ok'] = ok
+    Path(a.report).write_text(json.dumps(report, indent=1))
+    print(f'\n{"PASS" if ok else "FAIL"}; report written to {a.report}')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
