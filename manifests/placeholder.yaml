@@ -29,6 +29,7 @@ health:
 entry_canary:
   - type: http
     http: {method: GET, path: /v1/models, port: 8080}
+    body: null
     pass: {status: 200, contains: gt-placeholder}
 front_door:
   type: http
