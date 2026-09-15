@@ -7,8 +7,11 @@ jsonschema pyyaml`` or ``uv pip install -e '.[dev]'``)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +114,40 @@ def consistency_errors(manifest: dict[str, Any], *, allow_placeholder_digest: bo
     return problems
 
 
+def artifact_sha256(path: str | Path) -> str:
+    """An artifact's ``sha256`` as the controller and ``entrypoint.sh`` compute it (MANIFEST.md "Artifacts"): a file
+    hashes its bytes; a directory hashes ``<relpath>\\0<file sha256 hex>\\n`` over its files in sorted walk order,
+    skipping top-level dotfiles and dot-directories. '' when the path does not exist.
+
+        python3 scripts/_manifest.py /path/to/staged/model-dir
+    """
+
+    def file_sha256(p: str) -> str:
+        h = hashlib.sha256()
+        with open(p, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    path = str(path)
+    if os.path.isfile(path):
+        return file_sha256(path)
+    if not os.path.isdir(path):
+        return ''
+    walk = []
+    for root, dirs, files in os.walk(path):
+        if root == path:
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            files = [f for f in files if not f.startswith('.')]
+        walk.append((root, files))
+    h = hashlib.sha256()
+    for root, files in sorted(walk):
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            h.update(os.path.relpath(full, path).encode() + b'\0' + file_sha256(full).encode() + b'\n')
+    return h.hexdigest()
+
+
 def check(path: Path, *, allow_placeholder_digest: bool = True) -> tuple[dict[str, Any] | None, list[str]]:
     """(manifest, problems). A manifest that fails to parse or the schema returns problems and no further checks."""
     try:
@@ -121,3 +158,9 @@ def check(path: Path, *, allow_placeholder_digest: bool = True) -> tuple[dict[st
     if problems:
         return manifest, problems
     return manifest, consistency_errors(manifest, allow_placeholder_digest=allow_placeholder_digest)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        raise SystemExit('usage: python3 scripts/_manifest.py <artifact path>   (prints its sha256)')
+    print(artifact_sha256(sys.argv[1]) or 'MISSING')

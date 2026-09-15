@@ -26,9 +26,16 @@ failed = False
 for art in manifest.get('artifacts') or []:
     path, want = art['path'], art['sha256'].lower()
     if os.path.isdir(path):
-        # A directory artifact: sha256 over its files in sorted relative order, each as "<relpath>\0<sha256>\n".
+        # A directory artifact: sha256 over its files in sorted relative order, each as "<relpath>\0<sha256>\n",
+        # skipping top-level dotfiles and dot-directories (.revision, .gitattributes, .cache): markers, not content.
+        walk = []
+        for root, dirs, files in os.walk(path):
+            if root == path:
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                files = [f for f in files if not f.startswith('.')]
+            walk.append((root, files))
         h = hashlib.sha256()
-        for root, _dirs, files in sorted(os.walk(path)):
+        for root, files in sorted(walk):
             for name in sorted(files):
                 full = os.path.join(root, name)
                 fh = hashlib.sha256()

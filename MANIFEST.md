@@ -92,6 +92,28 @@ autoscale fields.
 | Drain not done by `drain.max_s` | failed drain: undeploy, then the full check; standing drops |
 | `profile` misses | standing drops only; never pay |
 
+## Artifacts
+
+The controller stages every `artifacts[]` entry into the volume whose `mount` holds its `path` **before** the
+container starts (the workload has no egress and never downloads), then verifies it on disk against `sha256`.
+
+| `source` | What the controller writes at `path` |
+|---|---|
+| `hf://<org>/<repo>` | the repo at `revision` (`hf download --revision`) as a directory, plus a `.revision` marker file holding `revision` |
+| `https://…` | one file, fetched as is (pin the URL itself, e.g. a Hugging Face `resolve/<commit>/<file>` URL) |
+| `data:,<text>` | one file whose content is `<text>`: a small marker or config your runtime expects beside its weights |
+
+**How `sha256` is computed** (the controller, `entrypoint.sh` and `python3 scripts/_manifest.py <path>` agree):
+
+- A **file**: the sha256 of its bytes.
+- A **directory**: the sha256 of `<relpath>\0<file sha256 hex>\n` for every file, in sorted walk order,
+  **skipping top-level dotfiles and dot-directories** (`.revision`, `.gitattributes`, `.cache`). Those are markers
+  and source metadata, not content, so the marker the controller writes never changes the digest. A dotfile deeper
+  in the tree is content and is hashed.
+
+Mount weights `read_only: true`. A runtime that insists on writing a file next to its weights gets that file as its
+own artifact instead (the controller writes it; the workload never does).
+
 ## Entry canary shapes
 
 The controller supports a few generic shapes. Each canary in the manifest picks one and fills it in:
@@ -203,15 +225,18 @@ entry_canary:                # one picked at random each start; sent at front_do
   - type: http
     http: {method: POST, path: /v1/chat/completions, port: 8080}
     body: {messages: [{role: user, content: "What is 17 × 23? Use the multiply tool."}], max_tokens: 64,
+           enable_thinking: false,
            tools: [{type: function, function: {name: multiply, parameters: {type: object,
              properties: {a: {type: number}, b: {type: number}}, required: [a, b]}}}]}
-    pass: {status: 200, regex: 'multiply[\s\S]*17[\s\S]*23'}
+    # one lookahead per fact: runtimes order tool_call keys differently (sparkinfer puts "arguments" before "name")
+    pass: {status: 200, regex: '(?=[\s\S]*"finish_reason":\s*"tool_calls")(?=[\s\S]*"name":\s*"multiply")(?=[\s\S]*\\"[ab]\\":\s*17\b)(?=[\s\S]*\\"[ab]\\":\s*23\b)'}
   - type: http
     http: {method: POST, path: /v1/chat/completions, port: 8080}
     body: {messages: [{role: user, content: "What's the weather in Paris right now? Use the tool."}], max_tokens: 64,
+           enable_thinking: false,
            tools: [{type: function, function: {name: get_weather, parameters: {type: object,
              properties: {city: {type: string}}, required: [city]}}}]}
-    pass: {status: 200, regex: 'get_weather[\s\S]*Paris'}
+    pass: {status: 200, regex: '(?=[\s\S]*"finish_reason":\s*"tool_calls")(?=[\s\S]*"name":\s*"get_weather")(?=[\s\S]*\\"city\\":\s*\\"Paris)'}
 profile:                     # health and standing only, never pay
   decode_tps_single: 99
   decode_tps_aggregate: 338
