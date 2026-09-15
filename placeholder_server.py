@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get('PORT', '8080'))
@@ -51,7 +52,9 @@ def main() -> None:
     server.daemon_threads = True
 
     def stop(signum, frame) -> None:  # the drain contract: SIGTERM -> finish -> exit
-        server.shutdown()
+        # shutdown() blocks until serve_forever() returns, and serve_forever() runs on this same (main) thread, so
+        # calling it from the signal handler deadlocks and the drain gets killed (exit 137). Stop from a thread.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)

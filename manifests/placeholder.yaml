@@ -1,0 +1,41 @@
+# The template's PLACEHOLDER image as a deployable workload: for smoke-testing the controller's bless → deploy →
+# reconcile → drain path on a real box without a model. It serves only GET /v1/models. Never bless this for miners.
+# Pin `image` to the digest your build produced; keep one small real artifact so pre-staging and the sha256 check
+# on the box are exercised (tiny-gpt2 here; any pinned HF revision with a known directory hash works).
+name: gt-placeholder
+version: 1
+description: Template placeholder server (GET /v1/models only) for controller smoke tests
+runtime: placeholder
+image: localhost/gt-placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000  # TODO your digest
+placement:
+  gpu_types: {include: [RTX5090]}
+  cards_per_instance: 1
+  min_vram_gb: 1
+  max_load_s: 60
+run:
+  env: {PORT: '8080', PLACEHOLDER_MODEL_ID: gt-placeholder}
+  volumes: [{name: models, mount: /models, read_only: true}]
+network:
+  egress: []
+artifacts:
+  - path: /models/tiny-gpt2
+    source: hf://sshleifer/tiny-gpt2
+    revision: TODO-commit-sha
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'  # TODO directory hash
+health:
+  http: {path: /v1/models, port: 8080, expect_status: 200}
+  interval_s: 30
+  failure_threshold: 3
+entry_canary:
+  - type: http
+    http: {method: GET, path: /v1/models, port: 8080}
+    pass: {status: 200, contains: gt-placeholder}
+front_door:
+  type: http
+  port: 8080
+  concurrency: 4
+  routes:
+    - {path: /v1/models, method: GET}
+drain:
+  type: requests
+  max_s: 15

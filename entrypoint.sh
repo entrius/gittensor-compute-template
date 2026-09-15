@@ -12,6 +12,9 @@
 # (`requests`) or write its state (`checkpoint`), and exit within that window. `kill` means no grace.
 set -euo pipefail
 
+# The manifest the check runs against. The controller bind-mounts the BLESSED manifest (the one it signed) read-only
+# over /manifest.yaml at start, so the artifacts verified are the ones the registry entry names, not whatever the
+# image happened to be built with. The baked copy is only the fallback for local `scripts/validate --build` runs.
 MANIFEST="${MANIFEST_PATH:-/manifest.yaml}"
 
 verify_artifacts() {
