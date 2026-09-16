@@ -185,7 +185,10 @@ declare `front_door: {type: batch}` today so the shape validates, but it will no
 | `kill` | no grace: the container is removed at once |
 
 Size `max_s` from your worst case. For an inference image that is the longest single completion at the slowest
-in-band decode speed (e.g. 4096 tokens at ~90 tok/s ≈ 45 s).
+in-band decode speed. **Output length is the runtime's own limit, not the pool's:** the gateway forwards `max_tokens`
+as the caller sent it (or omits it) and never caps it, so declare your runtime's cap in `run.env` (e.g. sparkinfer's
+`SPARKINFER_MAX_OUTPUT_TOKENS`, 16384 by default) and size `max_s` to cover it (16384 tokens at ~90 tok/s ≈ 3 min →
+`max_s: 240`). A cap you do not declare is whatever your engine does when a request omits `max_tokens`.
 
 ## The `profile` block
 
@@ -251,7 +254,7 @@ front_door:
     - {path: /v1/models, method: GET}
 drain:
   type: requests
-  max_s: 60                  # worst case 4096 tokens at ~90 tok/s ≈ 45 s
+  max_s: 240                 # worst case: the runtime's own output cap, 16384 tokens at ~90 tok/s ≈ 3 min
 ```
 
 The runnable version of this example, with placeholders filled so it passes the schema, is this repo's

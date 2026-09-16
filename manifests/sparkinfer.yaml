@@ -52,4 +52,4 @@ front_door:
     - {path: /v1/models, method: GET}
 drain:
   type: requests
-  max_s: 60
+  max_s: 240                 # covers the container's own SPARKINFER_MAX_OUTPUT_TOKENS (16384) at ~90 tok/s
