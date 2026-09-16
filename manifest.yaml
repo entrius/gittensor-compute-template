@@ -71,4 +71,4 @@ front_door:
     - {path: /v1/models, method: GET}
 drain:
   type: requests
-  max_s: 60                  # worst case 4096 tokens at ~90 tok/s ≈ 45 s
+  max_s: 240                 # worst case: the runtime's own output cap, 16384 tokens at ~90 tok/s ≈ 3 min
